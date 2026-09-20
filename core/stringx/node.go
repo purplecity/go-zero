@@ -170,6 +170,54 @@ func (n *node) add(word string) {
 
 // build 用 BFS(层序遍历)为所有节点构建 fail 指针,
 // 把 Trie 变成 AC 自动机。必须在全部 add 之后调用一次。
+//
+// 一、为什么外层 for len(nodes) > 0 不会死循环?
+//
+//	nodes 是一个 BFS 队列,收支是平的:
+//	  出队:每轮循环恰好移除 1 个节点(nodes[0] 取走,nodes[1:] 截掉);
+//	  入队:每个节点只在「它的父节点出队」时被放入一次,
+//	        Trie 是树(无环),每节点仅一个父节点 → 一生只入队一次。
+//	入队总数 = 节点总数(有限),队列必然耗尽。这是所有 BFS 的标准写法。
+//
+// 二、为什么必须是 BFS(按层处理),顺序不能乱?
+//
+//	算 child.fail 的过程依赖「父节点 nd 的 fail 已经算好」
+//	(内层从 nd.fail 沿链向上找)。BFS 按深度从小到大出队:
+//	处理第 k 层时,第 k-1 层的 fail 刚全部算完,依赖永远就绪。
+//
+// 三、内层 for cur != nil 也不会死循环:
+//
+//	fail 永远指向更浅的节点(真后缀必然比原串短),
+//	cur = cur.fail 每步深度严格减 1,最多 depth 步走到根;
+//	只有根的 fail 是 nil,走到根即退出。
+//
+// 四、为什么找的是 cur.fail.children[key] 而不是 cur.children[key]?
+//
+//	child 对应串 = "nd 的串 + key",它的候选后缀要从「去掉首字符」
+//	开始试:"nd 的串"的 fail + key 正好是「去首字符后再加 key」,
+//	即最长候选;链上继续向上 = 后缀从长到短依次尝试。
+//
+// 五、队列变化全过程(词典 {"he", "her", "she"}):
+//
+//	节点一律用单字符称呼(就是 children 里的 key)。
+//	树里有两个 'h'、两个 'e',按出队顺序对号入座即可。
+//
+//	初始:队列 [h, s],h.fail = s.fail = root   ← 第一层,fail 必是根
+//	出队 h → 孩子:字符 'e',下面记作 e:
+//	    cur=h,cur.fail=root,root 无 'e' → cur=root,cur.fail=nil
+//	    → e.fail = root;入队。队列:[s, e]
+//	出队 s → 孩子:字符 'h',下面记作 h(第一层已有一个 h,这是第二个):
+//	    cur=s,cur.fail=root,root 有 'h' → h.fail = h ✓(指向第一层那个 h)
+//	    入队。队列:[e, h]
+//	出队 e → 孩子:字符 'r',下面记作 r:
+//	    cur=e,cur.fail=root,root 无 'r' → cur=root,cur.fail=nil
+//	    → r.fail = root;入队。队列:[h, r]
+//	出队 h → 孩子:字符 'e',下面记作 e(这是树里第二个 e,路径 "she"):
+//	    cur=h,cur.fail=h(第一层的那个 h),h 有 'e'
+//	    → e.fail = e ✓✓(关键一跳,指向第二层的 e,即路径 "he" 的词尾节点)
+//	    入队。队列:[r, e]
+//	出队 r、出队 e(均无孩子)→ 队列空,结束。
+//	结果与文件头总结的 fail 全表完全一致。
 func (n *node) build() {
 	// 第一层节点的 fail 全部指向根(长度为 1 的串没有真后缀)。
 	var nodes []*node
