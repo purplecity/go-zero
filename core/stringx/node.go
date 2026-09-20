@@ -94,13 +94,15 @@
 //
 //	i  字符  动作
 //	0  u     root 无 u 分支,留在 root
-//	1  s     root→s
-//	2  h     s→sh
+//	1  s     root→s。s 非词尾;s.fail=root 也非词尾,无命中。
+//	2  h     s→sh。非词尾;fail 链 h(路径 "sh")→h(第一层)都非词尾,无命中。
 //	3  e     sh→she:she 是词尾 → 命中 "she" 区间 [1,4);
 //	        沿 fail 链 she→he:he 也是词尾 → 命中 "he" 区间 [2,4)
-//	4  r     she 无 r 分支 → fail 到 he 也无 → 回到 root
+//	4  r     she 无 r 分支 → fail 回退到 e(路径 "he"):he 有 'r'
+//	        分支 → 走到 r(路径 "her"):her 是词尾 → 命中 "her"[2,5)
 //
-//	整个文本只扫了一遍,一个位置(i=3)同时揪出两个词。
+//	整个文本只扫了一遍:i=3 一个位置同时揪出两个词,
+//	i=4 靠 fail 链救回 "her" —— 文本指针从头到尾没有回退过一步。
 //	命中区间记成 scope{start, stop}(rune 下标,左闭右开):
 //	start = i+1-节点depth,stop = i+1
 //	(depth 即「从根走到该节点用了几个字符」,正好是词长)。
@@ -250,9 +252,54 @@ func (n *node) build() {
 }
 
 // find 扫描文本(chars 为 rune 切片),收集所有关键词命中的区间
-// [start, stop)(rune 下标)。一个位置可能命中多个区间
-// (如词典含 "he"、"her",文本 "her" 在位置 2 同时命中两者),
+// [start, stop)(rune 下标)。一个位置可能命中多个区间,
 // fail 链回溯保证全部收集。
+//
+// 一、每个字符走三步,对应下面三段代码:
+//
+//	第 1 步 goto:cur 有该字符的孩子 → 直接走过去(顺路);
+//	第 2 步 fail:没有 → 沿 fail 链回退(cur = cur.fail),
+//	      在哪个节点能"接上"该字符,就从哪继续;
+//	      回退到根仍接不上 → child 为 nil,continue 跳过该字符。
+//	第 3 步 收取:沿 fail 链向上,每个标了 end 的节点都是一个
+//	      以 i 结尾的命中,记区间:start = i+1-child.depth
+//	      (depth 即词长),stop = i+1。走到根为止。
+//
+// 二、两个细节:
+//
+//  1. 第 2 步循环条件 `cur != n`:根的 fail 是 nil,没法再失配;
+//     且循环体是先 cur = cur.fail 再检查,所以根自己的孩子
+//     也有机会接上 —— 接上与走到根,都从循环内退出。
+//  2. 区间 start 的依据:fail 链上每个节点的 depth 不同
+//     (= 后缀长度 = 词长),所以每个 end 节点对应一个
+//     不同词长的命中;套公式 start = i+1-depth。
+//
+// 三、完整扫描示例:文本 "usher"(词典 {"he","her","she"});
+// 树里有两个 h、两个 e,按所在层区分:
+//
+//	i=0 'u': root 无 'u',cur 已是 root → child==nil,continue
+//	i=1 's': 第 1 步:root 有 's' → cur=s(第一层)。
+//	    第 3 步:child=s,s 非词尾;child=s.fail=root,收取结束。无命中。
+//	i=2 'h': 第 1 步:s 有 'h' → cur=h(第二层,路径 "sh")。
+//	    第 3 步:child=h,非词尾;child=h.fail=h(第一层的 h),
+//	    也非词尾;child=fail=root,收取结束。无命中。
+//	i=3 'e': 第 1 步:h 有 'e' → cur=e(第三层,路径 "she"),goto 顺路。
+//	    第 3 步:child=e(路径 "she"),e 是词尾
+//	    → 记区间 start=3+1-3=1,stop=4,即 "she"[1,4);
+//	    child=e.fail=e(第二层,路径 "he"),也是词尾
+//	    → 记区间 start=3+1-2=2,stop=4,即 "he"[2,4);
+//	    child=e.fail=root,收取结束。一个位置(i=3)揪出两个词。
+//	i=4 'r': 第 1 步:e(路径 "she")无 'r' 分支,child=nil。
+//	    第 2 步:进 fail 回退循环(条件 cur != root):
+//	    cur=cur.fail=e(第二层,路径 "he"),它有 'r' 分支
+//	    → cur=r(第三层,路径 "her"),child=r,接上了,跳出循环。
+//	    第 3 步:child=r,r 是词尾
+//	    → 记区间 start=4+1-3=2,stop=5,即 "her"[2,5);
+//	    child=r.fail=root,收取结束。
+//	    本步文本指针一动未动,纯靠 fail 链换位,救回 "her"。
+//
+//	命中结果:[1,4)"she"、[2,4)"he"、[2,5)"her"。
+//	复杂度 O(文本长 + 命中数),整个文本只扫一遍。
 func (n *node) find(chars []rune) []scope {
 	var scopes []scope
 	size := len(chars)
