@@ -44,7 +44,18 @@ func NewResourceManager() *ResourceManager {
 // Close closes the manager.
 // Don't use the ResourceManager after Close() called.
 // 关闭全部资源(逐个 Close,错误聚合返回),并清空资源表;
-// 之后不要再使用本管理器。
+// 之后不要再使用本管理器(真正的雷区:Close 之后的 GetResource/Inject
+// 会对 nil map 写入,那才会 panic)。
+//
+// Close 本身可重复调用(幂等),两次 Close 完全安全:
+//
+//  1. 第二次 range 的是 nil map:Go 规范规定 map 为 nil 时迭代
+//     次数为 0,循环体一次都不执行,不会 panic
+//     (map 只有对 nil 写入会 panic,读和遍历都安全);
+//  2. resources = nil 只是对结构体字段赋 nil 指针,不是 map 操作,
+//     赋多少次都一样;
+//  3. 两次 Close 被写锁串行,并发调用也无数据竞争;
+//  4. 第二次返回 nil(没有资源需要关,BatchError 为空)。
 func (manager *ResourceManager) Close() error {
 	manager.lock.Lock()
 	defer manager.lock.Unlock()
