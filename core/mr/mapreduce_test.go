@@ -15,7 +15,6 @@ import (
 
 var errDummy = errors.New("dummy")
 
-
 func TestFinish(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
