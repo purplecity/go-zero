@@ -88,6 +88,88 @@
 //	defer close 还兜底 panic:生产者中途死了也保证关闭,
 //	消费方不会对着死生产者无限等。
 //
+// 七、三层抽干对称 —— close 释放接收方,drain 释放发送方
+//
+//	每一层的消费者在"退出时"都会抽干它的上游通道
+//	(取一个扔一个,陪生产者走到 close),三层完全对称:
+//	  生产段  generate→source   消费者 executeMappers:
+//	          defer drain(source)(cancel 里另有一处);
+//	  映射段  mapper→collector  消费者 reducer:
+//	          其 goroutine defer drain(collector);
+//	  归约段  reducer→output    消费者 主 goroutine:
+//	          defer for range output(防多写检查,本质即
+//	          drain)+ panic 分支 drain(output)。
+//
+//	为什么必是"消费者抽干上游":唯一可能卡死的角色是发送方
+//	(无缓冲/缓冲满时,发送必须有人接)。消费者退出是主动行为,
+//	它一走,上游就没人接应了 —— 所以走之前必须陪到上游 close,
+//	生产者才能跑到 return、执行 defer close、不泄漏。
+//
+//	口诀:close 让等在接收上的人立刻醒(ok=false);
+//	drain 让卡在发送上的人走到收工。两者成对出现在每一层,
+//	全链 goroutine 才有始有终。
+//
+// 八、ctx 与 done —— 外部控制的入口,内部广播的闸门
+//
+//	ctx(options.ctx) 外部传入(默认 Background,WithContext
+//	                 可替换),表达"外面不要了":超时/上游取消,
+//	                 生命周期比本次调用长。
+//	done(doneChan)   每次调用内部临时创建,从不外部传入,
+//	                 随本次 MapReduce 调用同生共死。
+//
+//	三个终点汇入同一闸门:
+//	  外部 ctx 到期 → 主 goroutine 调 cancel(DeadlineExceeded)
+//	  业务取消     → mapper/reducer 调 cancel(err)
+//	  自然完成     → reducer 结束,其 defer 直接调 finish()
+//	  前两者走 cancel(once):记 retErr → drain(source) →
+//	  finish(closeOnce) —— 无论哪条路,最终都是
+//	  close(done) + close(output) = 全员停止广播。
+//
+//	两个信号的观察者高度重合(任一触发即动作):
+//	  executeMappers 循环:select 两路,停止派发;
+//	  两处 guardedWriter:Write 直接丢弃;
+//	  主 goroutine:直接看 ctx.Done;done 不直接看 ——
+//	  finish 同时关 output,主 select 从 output 关闭感知它。
+//	  generate 与 reducer goroutine 本身不看信号:前者靠
+//	  用户契约(要可中断就自己响应 ctx),后者靠 collector
+//	  关闭结束。
+//
+//	为什么有了 ctx 还要 done:
+//	  1. ctx 只能表达"取消",表达不了"正常完成";
+//	  2. 内部事件关不掉外部 ctx,广播只能用自己的通道;
+//	  3. done 每次调用一个新实例,状态不跨调用泄漏。
+//	方向口诀:ctx 外→内,done 内→全链。
+//
+// 九、cancel 总线 —— 唯一实例贯穿全链,第一票有效
+//
+//	cancel 定义在编排层(mapReduceWithPanicChan),定义后作为
+//	参数发放给每个角色,是流水线里贯穿最长的东西:
+//	  主 goroutine:ctx.Done 分支调 cancel(DeadlineExceeded)
+//	  —— 外部取消也被翻译成一次 cancel 调用;
+//	  reducer:签名第 3 参,业务判断失败即 cancel(err);
+//	  每个 mapper:签名第 3 参(executeMappers 闭包包装传入);
+//	  Finish 封装:fn() 出错即 cancel(err)。
+//	即:取消有多条来路(ctx 超时/业务失败),入口只有一个。
+//
+//	once(sync.Once)保证:并发调用安全,全局恰好生效一次;
+//	第一票的 err 原子存入 retErr,成为整个调用的返回错误
+//	(主 goroutine 在 output 分支取走),后来者全部静默无效
+//	—— first error wins。cancel(nil) 用 ErrCancelWithNil
+//	占位,避免"取消了但错误为 nil"的歧义。
+//
+//	拉闸即收尾,三步:记 retErr → drain(source) 放行生产者
+//	(第七节)→ finish() 关 done+output(第八节闸门),
+//	不存在"取消了但没人知道"的中间态。
+//
+//	不对称:generate 不持有 cancel —— 拉闸权只发给"见过
+//	数据的人"(mapper/reducer)与编排方;生产者卡住由
+//	drain 解救,而非自己拉闸。
+//
+//	三线分工(与七、八节拼成完整图景):
+//	  ctx/done 是"看"的(select 收听、writer 检查);
+//	  cancel 是"做"的(唯一入口、第一票有效);
+//	  finish 是"出"的(统一出口:关 done+output 广播停止)。
+//
 // ————————————————————————————————————————————————————————————————————————————
 package mr
 
@@ -213,6 +295,9 @@ func ForEach[T any](generate GenerateFunc[T], mapper ForEachFunc[T], opts ...Opt
 	panicChan := &onceChan{channel: make(chan any)}
 	source := buildSource(generate, panicChan)
 	collector := make(chan any)
+	// done 是"哑信号":只为填满 mapperContext/guardedWriter 的
+	// select 分支,ForEach 无人关它 —— 退出靠主循环收到
+	// collector 关闭(对比第八节:完整流程里 done 才承载广播)。
 	done := make(chan struct{})
 
 	go executeMappers(mapperContext[T, any]{
@@ -336,6 +421,8 @@ func buildSource[T any](generate GenerateFunc[T], panicChan *onceChan) chan T {
 // drain drains the channel.
 // 把 channel 里剩余的值全部喝干直到关闭:
 // 取消后生产者可能还卡在发送上,不喝干它们就永远退不出来。
+// 对偶口诀:close 释放接收方,drain 释放发送方(见文件头第七节);
+// 三层流水线里每一层消费者退出时都靠它陪生产者走到 close。
 func drain[T any](channel <-chan T) {
 	// drain the channel
 	for range channel {
@@ -420,7 +507,8 @@ func mapReduceWithPanicChan[T, U, V any](source <-chan T, panicChan *onceChan, m
 	// mapper → reducer 的缓冲通道(容量=并行数,削峰)。
 	collector := make(chan U, options.workers)
 	// if done is closed, all mappers and reducer should stop processing
-	// done 关闭 = 全员停止的广播信号。
+	// done 关闭 = 全员停止的广播信号:内部临时创建,从不外部传入,
+	// 随本次调用同生共死;唯一关闭点是 finish(见文件头第八节)。
 	done := make(chan struct{})
 	writer := newGuardedWriter(options.ctx, output, done)
 	var closeOnce sync.Once
@@ -434,8 +522,10 @@ func mapReduceWithPanicChan[T, U, V any](source <-chan T, panicChan *onceChan, m
 			close(output)
 		})
 	}
-	// cancel 取消入口(once 保证只生效一次):
-	// 记录错误 → 喝干 source(放行卡住的生产者)→ 全员收尾。
+	// cancel 取消总线:唯一实例发放给主 goroutine/reducer/
+	// 每个 mapper(见第九节);once 保证恰好生效一次、
+	// 第一票的错误胜出。拉闸三步:记录错误 → 喝干 source
+	// (放行卡住的生产者)→ finish 全员收尾。
 	cancel := once(func(err error) {
 		if err != nil {
 			retErr.Set(err)
@@ -505,7 +595,8 @@ func newOptions() *mapReduceOptions {
 	}
 }
 
-// once 把一个 func(error) 包装成只生效一次的取消函数。
+// once 把一个 func(error) 包装成只生效一次的取消函数:
+// 并发安全,第一票生效(其错误胜出),后来者静默丢弃。
 func once(fn func(error)) func(error) {
 	once := new(sync.Once)
 	return func(err error) {
