@@ -38,8 +38,7 @@
 
 <img src="https://raw.githubusercontent.com/zeromicro/zero-doc/main/doc/images/mapreduce-cn.png" width="500">
 
-
-如何实现随时终止流程呢？
+  如何实现随时终止流程呢？
 
 `goroutine` 中监听一个全局的结束 `channel` 和调用方提供的 `ctx` 就行。
 

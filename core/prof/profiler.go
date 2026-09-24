@@ -7,6 +7,12 @@
 //	... 干活 ...
 //	prof.Report("queueName", point) // 上报耗时
 //
+// 定位:框架自身从不调用本包(core/prof 之外零引用),
+// 纯属业务代码的 opt-in 自助工具;典型埋点姿势:
+//
+//	point := prof.Start()
+//	defer func() { prof.Report("name", point) }()
+//
 // 设计:全局 profiler 变量默认是 nullProfiler(空实现,零开销),
 // 调 EnableProfiling() 后切换为 realProfiler(把耗时上报给
 // profileCenter)—— 未开启剖析时业务代码完全无感、无开销,
