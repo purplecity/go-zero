@@ -71,7 +71,28 @@ func Done() <-chan struct{} {
 	return done
 }
 
-// stopOnSignal 幂等关闭 done(select+default 防止二次 close panic)。
+// stopOnSignal 幂等关闭 done —— 进程退出广播的总开关。
+//
+//	done 是全进程的退出广播(SIGTERM/SIGINT 时触发):close 一次,
+//	所有 select <-Done() 的等待者同时醒来,状态永久。
+//	两个信号分支都会调用本函数(常见场景:Ctrl+C 之后,
+//	Docker/K8s 等不及又发 SIGTERM),而 close 已关闭的 channel
+//	会 panic —— 所以必须幂等。
+//
+//	机关在 channel 的核心语义:关闭是【永久状态】,不是一次性
+//	事件 —— 从已关闭的 channel 接收,永远立刻就绪(返回零值,
+//	无限次,什么都不消耗)。接收方三态:
+//	  open+空+无发送方   阻塞 → select 里不就绪 → 走 default;
+//	  open+有值          立刻拿到值(每份只能拿一次);
+//	  closed             永远立刻就绪 → select 永远选本 case。
+//	于是:未关闭时 <-done 不就绪,default 里的 close 才执行;
+//	已关闭时 case 永远就绪,default 永远不会再执行 → 幂等。
+//	(context.Context 的 ctx.Done() 取消广播用的正是同一语义,
+//	所以循环里反复 select 它也不会"错过"取消。)
+//
+//	前提:本函数只被单一信号 goroutine 串行调用,防"重复"
+//	不防"并发";若可能并发调用,需改用 sync.Once 包住
+//	close(对比 mr 包 finish 的 closeOnce 做法)。
 func stopOnSignal() {
 	select {
 	case <-done:
