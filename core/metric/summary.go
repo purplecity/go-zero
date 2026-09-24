@@ -69,7 +69,33 @@ func NewSummaryVec(cfg *SummaryVecOpts) SummaryVec {
 	return sv
 }
 
-// Observe 记录一次观测。
+// Observe 记录一次观测。实现是一条两步链:
+//
+//	sv.summary.WithLabelValues(labels...).Observe(v)
+//
+//	第一步 WithLabelValues —— 从"向量"里选出这条序列:
+//	SummaryVec 不是单个指标,而是一族同构 summary,由创建时
+//	声明的 Labels(维度)区分;labels 的每种取值组合对应一条
+//	独立的时间序列(一个"孩子"),首次遇到该组合时惰性创建。
+//	例:Labels=["method"] 时,"get" 与 "post" 是两条互不
+//	干扰的序列。
+//
+//	第二步 .Observe(v) —— 向这条序列记一个样本:
+//	count+1、sum+=v,并按 Objectives(如 {0.99: 0.001})
+//	在客户端流式更新分位数估计;并发安全,可多 goroutine 直调。
+//
+//	例:Observe(0.123, "get") 即"给 method="get" 那条序列
+//	记一次 0.123 秒",/metrics 暴露形如:
+//	  xxx{method="get",quantile="0.99"} 0.8
+//	  xxx_sum{method="get"} 123.4
+//	  xxx_count{method="get"} 1000
+//
+//	注意:
+//	  1. labels 顺序必须与声明的 Labels 一致、数量相同,
+//	     否则 panic;
+//	  2. 外层 update() 是指标总闸:prometheus 未启用时
+//	     (未 StartAgent / 进程退出清理后)整段跳过,
+//	     打点开销归零(见 metric.go)。
 func (sv *promSummaryVec) Observe(v float64, labels ...string) {
 	update(func() {
 		sv.summary.WithLabelValues(labels...).Observe(v)
