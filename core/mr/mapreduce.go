@@ -31,6 +31,63 @@
 //	worker 池(pool)       限制并发 mapper 数(默认 16);
 //	drain                  把 channel 喝干,避免生产者阻塞卡死。
 //
+// 四、channel 接收语义 —— item, ok := <-source 是流水线的"取料口"
+//
+//	空且未关闭 → 阻塞等待,只有两种唤醒:
+//	  收到消息    item=该值, ok=true  —— 派给 mapper;
+//	  关闭且取干  item=零值, ok=false —— 归还名额、触发收尾。
+//	item/ok 总会被赋值,区别在取值 —— 先判 ok 再用 item,
+//	零值 item 绝不使用;已关闭的 channel 永不阻塞。
+//
+//	两点结合本文件:
+//	  1. source 无缓冲,"空"是常态 —— 生产者每发一个都要
+//	     等消费方来接,阻塞就是这个流水线的节拍(汇合点);
+//	  2. executeMappers 里这个接收不在 select 内:抢到 pool
+//	     名额后是裸阻塞收,ctx/doneChan 取消信号叫不醒它,
+//	     能唤醒它的只有"生产者来料"或"close(source)" ——
+//	     buildSource 的 defer close 保证后者必然发生,
+//	     所以不会永久卡死。
+//
+// 五、所有权协议 —— 每个 channel 恰好一个关闭者
+//
+//	并发收发本身永远安全;真正会 panic 的只有两件事:
+//	向已关闭的 channel 发送、关闭已关闭的 channel。
+//	两者都被"唯一 closer + 闸门"挡住:
+//	  source      唯一 closer:buildSource defer(成败都关);
+//	  collector   唯一 closer:executeMappers defer,且先
+//	              wg.Wait(等全部 mapper 返回,不可能还有
+//	              发送方)再 close —— send-on-closed 无从发生;
+//	  done/output 唯一 closer:finish(closeOnce 幂等),
+//	              reducer 侧与 executeMappers 侧都调也只关一次。
+//	reducer 提前退出后 drain(collector) 与 mapper 的发送并发,
+//	不仅安全,恰是为了放行卡在发送上的 mapper。
+//
+//	executeMappers 有四种退出触发(停了才走 defer 收尾链):
+//	  ctx 取消 / doneChan 关闭(捷径)/ source 取干(保底)/
+//	  mapper panic(failed)。等待图无环:drain(collector) 等
+//	close(collector),后者等 executeMappers 退出,而退出不
+//	依赖 done(有保底触发);drain(source) 只等生产者收工 ——
+//	契约内不可能死锁。契约:generate 必须有限(或响应 ctx);
+//	mapper 若卡死不返回,主流程仍可返回,仅泄漏该 goroutine。
+//
+// 六、close 语义 —— 关闭 ≠ 作废数据,buildSource 为何安全
+//
+//	close 只表示"不会再有发送":缓冲里未取走的值照样逐个
+//	收到(ok=true),取干后才 ok=false;for range ch 唯一的
+//	退出条件就是"已关闭且已取干"。所以"生产完就关、消费
+//	还没跟上"并不丢数据。
+//
+//	source 更进一步是无缓冲:发送必须有人接走才返回 →
+//	generate return 时每个值都已交付,不存在"没消费完就关";
+//	无缓冲 = 天然背压,生产者永远等消费者(见第四节 1)。
+//
+//	真正的反向风险是"发送方送不出去卡死"(取消后没人收了),
+//	这正是 drain 的使命:cancel 与 executeMappers defer 各有
+//	一处 drain(source)(丢弃是有意的:流程已取消),
+//	reducer goroutine 的 drain(collector) 同理放行 mapper。
+//	defer close 还兜底 panic:生产者中途死了也保证关闭,
+//	消费方不会对着死生产者无限等。
+//
 // ————————————————————————————————————————————————————————————————————————————
 package mr
 
@@ -256,6 +313,9 @@ func buildPanicInfo(r any, stack []byte) string {
 // buildSource 启动生产者 goroutine 执行 generate:
 // generate 结束(或 panic)后关闭 source,消费方的 range 自然结束;
 // panic 信息经 panicChan 传给主流程。
+// 关闭不丢数据:close 只表示"不再发送",缓冲值照样可取;
+// 且 source 无缓冲 —— generate 返回时每个值都已被接走
+// (详见文件头第六节);defer 保证 panic 时也关闭。
 func buildSource[T any](generate GenerateFunc[T], panicChan *onceChan) chan T {
 	source := make(chan T)
 	go func() {
@@ -289,8 +349,10 @@ func drain[T any](channel <-chan T) {
 func executeMappers[T, U any](mCtx mapperContext[T, U]) {
 	var wg sync.WaitGroup
 	defer func() {
-		wg.Wait()             // 等所有在飞的 mapper 结束
-		close(mCtx.collector) // 通知 reducer:没有更多输出了
+		// 顺序是安全核心:先等全部 mapper 返回(不可能还有
+		// 发送方)再 close —— send-on-closed 无从发生(第五节)。
+		wg.Wait()             // 等所有在飞 mapper 结束
+		close(mCtx.collector) // 通知 reducer:没有更多输出了(缓冲值仍可取)
 		drain(mCtx.source)    // 喝干 source,让生产者能退出
 	}()
 
@@ -306,8 +368,10 @@ func executeMappers[T, U any](mCtx mapperContext[T, U]) {
 		case <-mCtx.doneChan:
 			return
 		case pool <- struct{}{}:
-			// 占到一个 worker 名额,取下一个元素;
-			// source 已关闭时收尾退出。
+			// 占到一个 worker 名额,取下一个元素。
+			// 裸阻塞收(不在 select 内,取消信号叫不醒):
+			// source 空则等生产者来料(ok=true);
+			// source 已关闭则 ok=false —— 归还名额、收尾退出。
 			item, ok := <-mCtx.source
 			if !ok {
 				<-pool
