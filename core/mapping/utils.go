@@ -1,3 +1,31 @@
+// ————————————————————————————————————————————————————————————————————————————
+// utils —— tag 解析与反射赋值的工具集 —— 文件总结
+//
+// 为 unmarshaler.go/marshaler.go 提供三大类工具:
+//
+// 一、tag 解析(parse* 系)
+//
+//	parseKeyAndOptions:把 `json:"key,opt=v,…"` 拆成键
+//	  + fieldOptions;支持转义(\,)、分组括号、范围表达式
+//	  [l,r] / (l,r) 的开闭组合(parseNumberRange)。
+//	parseProperty/parseOption:逐个选项名值对解析
+//	  (default/env/optional/options=|range=[..]/inherit/string)。
+//
+// 二、反射赋值(set*/fill* 系)
+//
+//	SetValue/Deref/ValidatePtr:指针解引用、可写性检查;
+//	setValueFromString:字符串 → 各基础类型(含 time.Duration);
+//	validateAndSetValue:赋值前做区间/枚举校验。
+//
+// 三、必填判定与缓存
+//
+//	implicitValueRequiredStruct/structValueRequired:判断
+//	  struct 是否隐式必填(任一字段非 optional 即必填);
+//	optionsCache/structRequiredCache:两个 RWMutex 保护的
+//	  解析结果缓存 —— tag 串/类型 → 选项与必填结论,
+//	  避免每次反序列化重复解析。
+//
+// ————————————————————————————————————————————————————————————————————————————
 package mapping
 
 import (

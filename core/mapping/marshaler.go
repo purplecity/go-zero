@@ -1,3 +1,20 @@
+// ————————————————————————————————————————————————————————————————————————————
+// marshaler —— struct → 按 tag 分组导出(反向填充) —— 文件总结
+//
+// Marshal 把 struct 的每个字段按其 tag 键分组导出:
+//
+//	map[tag键][字段名] = 字段值
+//
+// 典型用途:API 请求 struct 同时声明 json/path/header 多套
+// tag,Marshal 一次把三组键值都导出来(参数校验、日志、
+// 签名等场景)。 匿名字段递归展开,结果并入外层分组。
+// Marshal 与 Unmarshaler 是一对:一个 struct → map(按 tag
+// 分组),一个 map → struct(按 tag 填充)。
+//
+// 导出前做 tag 声明的校验(与反序列化同规则):
+// 非 optional 字段必须非零;options 枚举;range 区间。
+// 注意:optional=another 依赖未实现(少用且难实现)。
+// ————————————————————————————————————————————————————————————————————————————
 package mapping
 
 import (
@@ -8,7 +25,9 @@ import (
 )
 
 const (
-	emptyTag       = ""
+	// emptyTag 无 tag 字段归入的分组键(空串)。
+	emptyTag = ""
+	// tagKVSeparator tag 里键与选项的分隔符 ":"。
 	tagKVSeparator = ":"
 )
 
@@ -23,8 +42,11 @@ const (
 //		Foo
 //		Bar string  `json:"bar"`
 //	}
+//
+// 导出 struct 字段:结果按 tag 键分组,匿名字段递归展开。
 func Marshal(val any) (map[string]map[string]any, error) {
 	ret := make(map[string]map[string]any)
+	// 类型与值都解一层指针。
 	tp := reflect.TypeOf(val)
 	if tp.Kind() == reflect.Ptr {
 		tp = tp.Elem()
@@ -45,6 +67,8 @@ func Marshal(val any) (map[string]map[string]any, error) {
 	return ret, nil
 }
 
+// getTag 从 struct tag 原文里取键名:取 ":" 前的部分
+// (有 ":" 说明带了选项);无分隔符则整串是键。
 func getTag(field reflect.StructField) (string, bool) {
 	tag := string(field.Tag)
 	if i := strings.Index(tag, tagKVSeparator); i >= 0 {
@@ -54,6 +78,7 @@ func getTag(field reflect.StructField) (string, bool) {
 	return strings.TrimSpace(tag), false
 }
 
+// insertValue 收集一个值:collector[tag分组][key] = val。
 func insertValue(collector map[string]map[string]any, tag string, key string, val any) {
 	if m, ok := collector[tag]; ok {
 		m[key] = val
@@ -64,6 +89,9 @@ func insertValue(collector map[string]map[string]any, tag string, key string, va
 	}
 }
 
+// processMember 处理单个字段:
+// 解 tag 键与选项 → 校验 → 取值(FromString 则转字符串)
+// → 匿名字段递归 Marshal 并入 / 普通字段直接收集。
 func processMember(field reflect.StructField, value reflect.Value,
 	collector map[string]map[string]any) error {
 	var key string
@@ -71,6 +99,7 @@ func processMember(field reflect.StructField, value reflect.Value,
 	var err error
 	tag, ok := getTag(field)
 	if !ok {
+		// 无 tag:归入空分组,字段名作键。
 		tag = emptyTag
 		key = field.Name
 	} else {
@@ -79,17 +108,20 @@ func processMember(field reflect.StructField, value reflect.Value,
 			return err
 		}
 
+		// 带 tag 的字段按选项校验。
 		if err = validate(field, value, opt); err != nil {
 			return err
 		}
 	}
 
 	val := value.Interface()
+	// FromString:值统一转字符串形式。
 	if opt != nil && opt.FromString {
 		val = fmt.Sprint(val)
 	}
 
 	if field.Anonymous {
+		// 匿名字段:递归导出内层,结果并入本层分组。
 		anonCollector, err := Marshal(val)
 		if err != nil {
 			return err
@@ -107,6 +139,9 @@ func processMember(field reflect.StructField, value reflect.Value,
 	return nil
 }
 
+// validate 按 tag 选项校验字段值:
+// 非 optional → 必须非零;optional 且为零 → 通过;
+// 再查 options 枚举与 range 区间。
 func validate(field reflect.StructField, value reflect.Value, opt *fieldOptions) error {
 	if opt == nil || !opt.Optional {
 		if err := validateOptional(field, value); err != nil {
@@ -118,6 +153,7 @@ func validate(field reflect.StructField, value reflect.Value, opt *fieldOptions)
 		return nil
 	}
 
+	// 可选且为零值:直接放行(不必再查枚举/区间)。
 	if opt.Optional && value.IsZero() {
 		return nil
 	}
@@ -137,6 +173,7 @@ func validate(field reflect.StructField, value reflect.Value, opt *fieldOptions)
 	return nil
 }
 
+// validateOptional 必填检查:指针非 nil、slice/map 非空。
 func validateOptional(field reflect.StructField, value reflect.Value) error {
 	switch field.Type.Kind() {
 	case reflect.Ptr:
@@ -152,6 +189,7 @@ func validateOptional(field reflect.StructField, value reflect.Value) error {
 	return nil
 }
 
+// validateOptions 枚举校验:值的字符串形式必须在白名单里。
 func validateOptions(value reflect.Value, opt *fieldOptions) error {
 	val := fmt.Sprint(value.Interface())
 	if !slices.Contains(opt.Options, val) {
@@ -161,6 +199,8 @@ func validateOptions(value reflect.Value, opt *fieldOptions) error {
 	return nil
 }
 
+// validateRange 区间校验:数值转 float64 后按
+// [left, right] / (…) 开闭组合判断。
 func validateRange(value reflect.Value, opt *fieldOptions) error {
 	var val float64
 	switch v := value.Interface().(type) {
@@ -193,6 +233,7 @@ func validateRange(value reflect.Value, opt *fieldOptions) error {
 	}
 
 	// validates [left, right], [left, right), (left, right], (left, right)
+	// 越界或踩到开区间端点即失败。
 	if val < opt.Range.left ||
 		(!opt.Range.leftInclude && val == opt.Range.left) ||
 		val > opt.Range.right ||

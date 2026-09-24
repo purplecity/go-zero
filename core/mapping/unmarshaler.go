@@ -1,3 +1,42 @@
+// ————————————————————————————————————————————————————————————————————————————
+// unmarshaler —— 通用反序列化引擎(map → struct) —— 文件总结
+//
+// 输入任意 map[string]any(或实现 Valuer 的数据源),按 struct
+// 的指定 tag 键(如 json/key/header)反射填充,是 go-zero
+// 配置加载、API 参数绑定的公共底座。
+//
+// 一、总入口与分发
+//
+//	Unmarshal/UnmarshalValuer → unmarshalWithFullName:
+//	  实现了 encoding/json.Unmarshaler → 交给它自己;
+//	  map 目标 → fillMap;slice 目标 → fillSlice;
+//	  struct → 逐字段 processField 系;
+//	  基础类型 → fillPrimitive。
+//
+// 二、struct 字段处理主线
+//
+//	processNamedField:取 tag 键与选项 → getValue 查值
+//	  (多 key 逗号分隔依次找,opaqueKeys 关闭该行为)→
+//	  有值:按目标类型路由(processFieldPrimitive/
+//	  processFieldStruct/fillSlice/…;FromString 时先走
+//	  字符串转换;env 选项可从环境变量兜底);
+//	  无值:optional 放行 / default 填充 / 否则报缺字段。
+//	匿名字段:递归展平(processAnonymousField 系),
+//	  内层字段可直接用外层的值(继承语义)。
+//
+// 三、tag 选项(细节见 fieldoptions.go / utils.go)
+//
+//	key,opt1,opt2,…  optional[=dep[=!dep]]/default=/env=
+//	  /range=[l,r]/options=a|b|c/inherit/fromString
+//	数字统一按 json.Number 处理,validate* 做区间/枚举校验。
+//
+// 四、三个包级缓存(锁保护的 lazy cache)
+//
+//	cacheKeys:tag 键串 → 拆出的 key 列表(多 key 支持);
+//	defaultCache:类型 → 默认值实例(WithDefault 填零值用);
+//	每个 Unmarshaler 只持配置,无状态,可全局复用。
+//
+// ————————————————————————————————————————————————————————————————————————————
 package mapping
 
 import (
