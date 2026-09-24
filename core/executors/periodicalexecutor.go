@@ -23,11 +23,53 @@
 //  2. 后台 goroutine 退出前 defer Flush(清空残批);
 //  3. proc.AddShutdownListener 注册进程退出 Flush。
 //
-// 三、为什么需要 wgBarrier:waitGroup 的 Add 必须与 Wait 互斥
+// 三、为什么需要 wgBarrier —— 对 Add/Done/Wait 的不对称保护
 //
-//	(标准库要求),但 pe.lock 保护不了它 —— Barrier 把
-//	Add/Done/Wait 的调用串行化,避免 Wait 与 Add 竞态导致
-//	Wait 提前返回。
+//	标准库规则:计数为 0 时刻发生的正增量 Add,必须
+//	happens-before Wait,否则是数据竞争,Wait 可能提前返回。
+//
+//	竞态场景(无 Barrier 时):
+//	  后台刚接手一批任务,即将 Add(1);
+//	  调用方 Wait() 恰在 Add(1) 生效前读到计数 0 → 立即返回,
+//	  而这批任务还在飞 —— 漏等(当年正是 -race 抓出后才加的)。
+//
+//	wgBarrier(本质是 Mutex)只把 Add(+1) 与 Wait 串行化:
+//	enterExecution 在 Guard 内 Add,Wait 也在 Guard 内 Wait,
+//	二者不再交错;要么 Add 先注册好,要么 Wait 先返回。
+//
+//	doneExecution 的 Done 刻意不进 Barrier,两个原因:
+//	  1. 不需要 —— Done 是负增量,只会让计数更小,
+//	     "边 Done 边 Wait" 本就是 WaitGroup 的正常用法;
+//	  2. 会死锁 —— Wait 在 Guard 内持锁等计数归零,而归零恰恰
+//	     依赖 Done;Done 若再抢同一把锁 → 互相等,永远卡死。
+//
+//	一句话:Barrier 只隔离 Add(+1) 与 Wait 这对有竞态的组合;
+//	Done(-1) 必须留在 Barrier 外 —— 既无必要,也不允许。
+//
+// 四、两条刷出路径 —— Add 走 commander,Flush 直接执行
+//
+//	Add 触发(攒够阈值)→ 异步快路径:整批扔进 commander,
+//	  等 confirmChan 确认后立即返回,业务方不等执行完 —— 管吞吐。
+//	Flush 触发(到点/强制/收尾)→ 同步兜底路径:RemoveAll 取走
+//	  残批,在当前 goroutine 当场执行完才返回 —— 管"碎任务
+//	  最终一定被执行"。五个调用点:ticker 到点(周期执行器的
+//	  "定时"二字就是它)、后台退出前 defer、Wait() 开头、
+//	  进程退出 listener、Bulk/ChunkExecutor 的公开 Flush API。
+//
+//	Flush 为何刻意不走 commander(改了就错):
+//	  1. 自死锁 —— backgroundFlush 自己就是 Flush 的调用方,
+//	     而 commander 的消费者、confirmChan 的发送者只有它自己;
+//	     自己发、自己等自己确认 → 永远等不到;
+//	  2. commander 容量 1,是交接槽不是队列 —— 后台忙时它是满的,
+//	     Flush 入队会阻塞;而 Wait/进程退出恰恰依赖 Flush 的
+//	     同步性(返回即执行完),改异步则 Wait 语义被破坏;
+//	  3. 生命周期 —— 进程退出/后台已退出时没有活着的消费者,
+//	     任务会永远躺在通道里丢失;直接执行不依赖后台存活。
+//
+//	账目也分开:commander 路径记 inflight(shallQuit 靠它判断
+//	后台能否退出);Flush 路径走 waitGroup。Flush 内先
+//	enterExecution() 加计数、再 RemoveAll 取任务 —— 顺序保证
+//	Wait 不会漏等这批(即第二节第 1 条保险)。
 //
 // ————————————————————————————————————————————————————————————————————————————
 package executors
@@ -77,7 +119,8 @@ type (
 		// waitGroup 追踪在飞的任务批,支撑 Wait。
 		waitGroup sync.WaitGroup
 		// avoid race condition on waitGroup when calling wg.Add/Done/Wait(...)
-		// wgBarrier 串行化 waitGroup 的 Add/Done/Wait(见文件头第三节)。
+		// wgBarrier 串行化 waitGroup 的 Add 与 Wait(见文件头第三节);
+		// 注意:Done 并不在 Guard 内 —— 它并发安全,包进来反而死锁。
 		wgBarrier syncx.Barrier
 		// confirmChan Add → 后台接手确认:保证 Add 返回时批已交接。
 		confirmChan chan lang.PlaceholderType
@@ -125,7 +168,9 @@ func (pe *PeriodicalExecutor) Add(task any) {
 }
 
 // Flush forces pe to execute tasks.
-// 强制刷出:取走容器里全部任务立即执行(即使只有一条也执行)。
+// 强制刷出:取走容器里全部任务,在当前 goroutine 同步执行完才返回
+// (即使只有一条也执行)。刻意不走 commander —— 三个原因见文件头第四节;
+// 调用方(ticker/Wait/退出收尾)都依赖"返回即执行完"这一同步语义。
 func (pe *PeriodicalExecutor) Flush() bool {
 	pe.enterExecution()
 	return pe.executeTasks(func() any {
@@ -217,11 +262,15 @@ func (pe *PeriodicalExecutor) backgroundFlush() {
 }
 
 // doneExecution 一个任务批执行完毕,计数减一。
+// Done 刻意不进 wgBarrier:负增量与 Wait 并发安全(标准用法),
+// 若进 Barrier 会与持锁等计数归零的 Wait 互相等待而死锁。
 func (pe *PeriodicalExecutor) doneExecution() {
 	pe.waitGroup.Done()
 }
 
 // enterExecution 登记一个在飞任务批(Barrier 内 Add,防 Wait 竞态)。
+// Add(+1) 必须与 Wait 互斥:否则计数为 0 时,Wait 可能在 Add 生效前
+// 读到 0 直接返回,漏等这批任务(标准库文档明确要求)。
 func (pe *PeriodicalExecutor) enterExecution() {
 	pe.wgBarrier.Guard(func() {
 		pe.waitGroup.Add(1)
