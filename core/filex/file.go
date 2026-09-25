@@ -70,7 +70,8 @@ func firstLine(file *os.File) (string, error) {
 
 // lastLine 反向取末行:从文件尾按块回扫,块内从后往前找
 // '\n',其后内容即末行;buf 拼到已积累内容的头部(保持顺序)。
-// 跳过文件末尾恰好结尾的换行,否则会取到空行。
+// 文件结尾换行只在【尾块】里 trim(offset+bufLen==文件大小),
+// 中间块尾的 '\n' 是末行起点边界,留给反扫命中(见下方注释)。
 func lastLine(filename string, file *os.File) (string, error) {
 	info, err := os.Stat(filename)
 	if err != nil {
@@ -101,8 +102,16 @@ func lastLine(filename string, file *os.File) (string, error) {
 			break
 		}
 
-		// 块尾正好是换行则去掉,避免末行为空。
-		if buf[n-1] == '\n' {
+		// 只有尾块(读的区间终点==文件大小)末尾的 '\n' 才是
+		// "文件结尾换行",需要去掉 —— 否则反扫会命中它返回空串,
+		// 把空串当成最后一行。中间块末尾的 '\n' 是最后一行的
+		// 【起点边界】(下一块从行首开始),绝不能去:去了边界
+		// 就丢,本属于上一行的整块会被并进结果(上游 bug,
+		// 触发条件为最后一个分隔 '\n' 之后的字节数恰为 bufSize
+		// 的整数倍,见 zeromicro/go-zero#5787)。中间块尾若是
+		// '\n',下方反扫会在 i=n-1 命中,返回 buf[n:]+last
+		// 即 last —— 最后一行从下一块开始,恰为正确答案。
+		if offset+bufLen == info.Size() && buf[n-1] == '\n' {
 			buf = buf[:n-1]
 			n--
 		} else {
