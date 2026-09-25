@@ -5,12 +5,15 @@
 // 保证完整行不会跨块:先按"文件大小/chunks+1"估出每块的
 // 理想终点,再把终点向后推到下一个换行(skipPartialLine),
 // 使每块都以整行结尾。+1 是让最后一块不至于太小。
+// 若理想切点落在最后一行内部(其后再无换行),末行整行并入
+// 当前块(不切断,见循环内对 io.EOF 的特判)。
 // 与 rangereader.go 配套:切出的区间交给 RangeReader 读取,
 // 即可实现多 goroutine 各扫一块大文件,块内都是完整行。
 // ————————————————————————————————————————————————————————————————————————————
 package filex
 
 import (
+	"errors"
 	"io"
 	"os"
 )
@@ -72,7 +75,17 @@ func SplitLineChunks(filename string, chunks int) ([]OffsetRange, error) {
 		// 理想终点 [offset, offset+preferSize) 可能切断一行,
 		// 把终点推到下一行首,保证整行归前一块。
 		offsetRange, err := nextRange(file, offset, offset+preferSize)
-		if err != nil {
+		if errors.Is(err, io.EOF) {
+			// 切点落在最后一行内部(其后直到文件尾再无换行),
+			// skipPartialLine 找不到"下一行的开头"而返回 EOF。
+			// 按"整行不切断"的契约,把最后一行整行并入本块,
+			// Stop 取文件末尾;下方 Stop < Size 不成立,自然退出。
+			offsetRange = OffsetRange{
+				File:  filename,
+				Start: offset,
+				Stop:  info.Size(),
+			}
+		} else if err != nil {
 			return nil, err
 		}
 
@@ -105,6 +118,9 @@ func nextRange(file *os.File, start, stop int64) (OffsetRange, error) {
 // (连同其后的连续换行),返回下一行首的偏移:
 // 遇到非换行字符 → 还在残行里,继续;
 // 遇到换行 → 跳过连续的 \r\n,碰到非换行即到达新行首。
+// 契约:扫到 EOF 仍无换行时返回 io.EOF —— 语义是切点位于
+// 最后一行内部(其后不存在"下一行"),由调用方决定收尾
+// (见 SplitLineChunks 循环内的 EOF 特判)。
 func skipPartialLine(file *os.File, offset int64) (int64, error) {
 	for {
 		skipBuf := make([]byte, bufSize)

@@ -58,10 +58,16 @@ func DoWithTimeout(fn func() error, timeout time.Duration, opts ...DoOption) err
 				panicChan <- fmt.Sprintf("%+v\n\n%s", p, strings.TrimSpace(string(debug.Stack())))
 			}
 		}()
+		// fn 正常返回(含 nil)就是一次普通发送:error 接口的
+		// nil 也是合法值,channel 只管"有个值进来了"、不关心
+		// 是不是 nil —— 成功路径即 done <- nil,下方 select 的
+		// done 分支照常就绪;case 不就绪的唯一情形是"没有发送
+		// 发生"(如 fn panic 时改走 panicChan,done 永无发送)。
 		done <- fn()
 	}()
 
-	// 三选一:panic 优先转发,其次正常结果,最后超时/取消。
+	// 三选一:panic 优先转发,其次正常结果(成功时 err 为 nil,
+	// 收 nil 与收非 nil 对 select 完全等价),最后超时/取消。
 	select {
 	case p := <-panicChan:
 		panic(p)

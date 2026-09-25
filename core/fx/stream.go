@@ -12,13 +12,18 @@
 //     AllMatch/AnyMatch/NoneMatch —— 消费流并得出结果;
 //  3. 终结副作用:ForEach/ForAll/Parallel/Done。
 //
-// 两个反复出现的关键细节:
+// 三个反复出现的关键细节:
 //
 //	A. 提前返回必须 drain:First/AnyMatch 等短路算子返回前
 //	   `go drain(s.source)` —— 上游还阻塞在发送上,不喝干
 //	   生产者 goroutine 就泄漏(同 mr 包的 drain 哲学);
 //	B. 并发度:Walk 系(含 Map/Filter/Parallel)默认 16 个
-//	   worker(pool 信号量限流),UnlimitedWorkers 可放开。
+//	   worker(pool 信号量限流),UnlimitedWorkers 可放开;
+//	C. close 的合法性判据:唯一要求是"【不会再有发送】",
+//	   与消费状态无关 —— 关闭后缓冲值照常逐个可收(每个
+//	   ok=true),取干后零值+ok=false,故先关后读(Just)、
+//	   边读边关都安全;唯一禁区是关了还有人发(panic)。
+//	   多写者须先 Wait 确认全部退出才能关(见 Concat)。
 //
 // ————————————————————————————————————————————————————————————————————————————
 package fx
@@ -110,12 +115,27 @@ func From(generate GenerateFunc) Stream {
 }
 
 // Just converts the given arbitrary items to a Stream.
-// 把已有元素变成流:缓冲恰好 len(items),填完即关。
+// 把已有元素变成流:急切版生产者 —— 数据全在手上,不需要
+// goroutine,当前 goroutine 同步灌入后【提前 close】再交出
+// 读端(对照 From 的惰性 goroutine 生产)。
+//
+//	缓冲必须恰好 len(items):再小,灌入会在无人消费时阻塞
+//	死锁(尚未 return,读端还不存在);这是"灌入永不阻塞"
+//	的最小值,再大只是白占内存。空参数则缓冲 0、立即关,
+//	得到空流。
+//
+//	先 close 后消费为何安全 —— close 的合法性唯一判据是
+//	"不会再有发送",与消费无关:关闭 ≠ 作废数据,缓冲里的
+//	值照样逐个收到(每个 ok=true),取干后才零值+ok=false;
+//	for range 的退出条件正是"已关闭且已取干"。Sort/Reverse/
+//	Merge 收完全量后重发射,复用的正是本函数。
 func Just(items ...any) Stream {
+	// 缓冲恰好装下全部元素:灌入永不阻塞的最小值。
 	source := make(chan any, len(items))
 	for _, item := range items {
 		source <- item
 	}
+	// 发送已全部完成,"不会再有发送"成立 —— 此刻关闭永远安全。
 	close(source)
 
 	return Range(source)
@@ -184,13 +204,33 @@ func (s Stream) Buffer(n int) Stream {
 }
 
 // Concat returns a Stream that concatenated other streams
-// 拼接流:多条流的元素汇入一条(source 惰性求值无序,
-// 各条流的 goroutine 并发搬运)。
+// 合流(名字叫拼接,实际是并发合流,顺序不保证):本流与
+// others 各起一个转发 goroutine 同时搬运,汇入同一条 channel。
+//
+// 读写端模式:返回的 Stream 只是【读端】,goroutine 是
+// 【写端】,二者共享同一个 channel 完成接驳 —— 这是本文件
+// 所有惰性算子的统一结构,Concat 的特殊之处仅是写端有多个。
+//
+// 两个要点:
+//
+//	顺序不保证 —— 所有转发器同时起跑(group.Run 不阻塞),
+//	抢同一无缓冲 channel 的握手权,输出交错且每次运行可能
+//	不同(实测 Just(1..5) 合流 Just(6..10) 可得
+//	[6 1 7 8 9 2 3 4 5 10]);要顺序就得串行化
+//	(先等前一条流搬完再启动后一条)。
+//
+//	close 时机 = Wait(所有写者退出)—— 多写者共享一个
+//	channel,必须等全部写完才能 close(同 mr 包 wg.Wait 后
+//	close(collector) 的手法,早 close 即 send on closed);
+//	而"全部写完"能等价于"全部被消费",靠的是无缓冲的同步
+//	握手:转发器退出前,最后一笔发送必须已被下游接走。
+//	记法:Wait 管安全 close,无缓冲管"转发完成⟹消费完成"。
 func (s Stream) Concat(others ...Stream) Stream {
 	source := make(chan any)
 
 	go func() {
 		group := threading.NewRoutineGroup()
+		// 转发器 1:本流的元素搬入 source(立刻开跑,不等别人)。
 		group.Run(func() {
 			for item := range s.source {
 				source <- item
@@ -198,7 +238,8 @@ func (s Stream) Concat(others ...Stream) Stream {
 		})
 
 		for _, each := range others {
-			each := each // 捕获各自流的循环变量
+			each := each // 捕获各自流的循环变量(Go1.22 前必需)
+			// 转发器 2..N:其余流的元素也同时搬入 —— 交错由此而来。
 			group.Run(func() {
 				for item := range each.source {
 					source <- item
@@ -317,8 +358,20 @@ func (s Stream) Group(fn KeyFunc) Stream {
 }
 
 // Head returns the first n elements in p.
-// 取前 n 个:够数即提前关闭下游(让后继尽快开工),
-// 同时 drain 上游剩余 —— 直接 break 会让生产者永久卡死。
+// 取前 n 个。注意这里同时操作【两条】channel,容易看混
+// (名字只差两个字符):source 是新建的下游管道,s.source
+// 是上游。n==0 时刻起,两件事并行推进:
+//
+//	对下游 = "提前打烊"的店主:close(source) 让等在下游的
+//	  消费者立刻看到"已关闭且取干",它们的 for range 退出、
+//	  后继算子 ASAP 开工(close 只影响等在这条 channel 上
+//	  的人,与上游循环无关 —— 循环退出条件是 s.source 被
+//	  【上游生产者】关闭且取干);
+//	对上游 = "陪跑到关门"的最后一位客人:循环【不会停】,
+//	  继续收上游元素但全部丢弃(n 已为负,两个 if 都不命中),
+//	  直到上游关闭取干才自然退出 —— 这就是 drain 的化身,
+//	  显式 drain(s.source) 与循环自弃等价,都是防止上游
+//	  生产者卡死在发送上(break 会 → goroutine 泄漏)。
 func (s Stream) Head(n int64) Stream {
 	if n < 1 {
 		panic("n must be greater than 0")
@@ -334,17 +387,19 @@ func (s Stream) Head(n int64) Stream {
 			}
 			if n == 0 {
 				// let successive method go ASAP even we have more items to skip
-				// 提前关闭下游:后继算子立即知道"没有了"。
+				// 角色 1(对下游):提前打烊 —— 后继算子立即知道"没有了"。
 				close(source)
 				// why we don't just break the loop, and drain to consume all items.
 				// because if breaks, this former goroutine will block forever,
 				// which will cause goroutine leak.
-				// 不 break 而是 drain:break 会让上游生产者永久阻塞 → 泄漏。
+				// 角色 2(对上游):陪跑到关门 —— 不 break 而是 drain,
+				// break 会让上游生产者永久阻塞 → goroutine 泄漏。
 				drain(s.source)
 			}
 		}
 		// not enough items in s.source, but we need to let successive method to go ASAP.
-		// 元素不足 n:全部转发后也要关闭下游。
+		// 元素不足 n(循环耗尽上游而 n 未到 0):
+		// 全部转发后也要关闭下游,别让后继干等。
 		if n > 0 {
 			close(source)
 		}
@@ -442,14 +497,21 @@ func (s Stream) Reduce(fn ReduceFunc) (any, error) {
 }
 
 // Reverse reverses the elements in the stream.
-// 反转:全量收集后首尾对调,再以 Just 重新发射。
+// 反转:全量收集后首尾对调,再以 Just 重新发射 —— 流式反转
+// 必须先看到最后一个元素才知道谁排第一,故与 Sort/Merge 同类,
+// 只能全量收集。
 func (s Stream) Reverse() Stream {
 	var items []any
 	for item := range s.source {
 		items = append(items, item)
 	}
 	// reverse, official method
-	// 首尾对调反转切片。
+	// 首尾对调反转切片。正确性:i 取遍前半区 [0, n/2),
+	// 镜像位 n-1-i 恰取遍后半区,每对恰好交换一次;
+	// 奇数长度时中位元素被整数除法(len/2 向下取整)自然排除。
+	// Go 1.21+ 可直接用标准库 slices.Reverse 替换本循环
+	// (与它逐位等价,n=0..9 已对照验证);保留手写仅为与
+	// 上游保持一致,属 Go 1.21 之前的历史写法。
 	for i := len(items)/2 - 1; i >= 0; i-- {
 		opp := len(items) - 1 - i
 		items[i], items[opp] = items[opp], items[i]
