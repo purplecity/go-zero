@@ -97,6 +97,16 @@ func ReadText(filename string) (string, error) {
 // ReadTextLines reads the text lines from given file.
 // 按行读取文件,可配过滤选项:Trim 空白(默认)/跳过空行/
 // 跳过指定前缀行(如注释 "#")。
+//
+// Scanner 按行读的三个坑:
+// 1. 单行上限 64KB(bufio.MaxScanTokenSize):内部缓冲 4KB 起步
+//    翻倍增长,最多到 64KB,一行仍放不下即报 ErrTooLong;
+//    超长行需先调 scanner.Buffer() 放大上限。
+// 2. Scan() 返回 false 可能是 EOF 也可能是读错误,循环退出后
+//    必须查 scanner.Err()(即下方 return 的 err),否则吞掉错误。
+// 3. Text() 每次都把内部 []byte 拷贝成新 string;逐行处理大文件
+//    可用 Bytes() 免这次拷贝,但其内容在下次 Scan() 后失效,
+//    不可留存。
 func ReadTextLines(filename string, opts ...TextReadOption) ([]string, error) {
 	var readOpts textReadOptions
 	for _, opt := range opts {
