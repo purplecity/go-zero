@@ -200,6 +200,62 @@ func TestTimingWheel_MoveTimerEarlier(t *testing.T) {
 	assert.True(t, run.True())
 }
 
+// 回归测试:Move 发生在指针走动之后(旧实现在此几何下会
+// 早/晚整整一圈,同瞬间的 Set+Move 用例覆盖不到)。
+func TestTimingWheel_MoveTimerMidFlight(t *testing.T) {
+	tests := []struct {
+		slots      int
+		setDelay   int // ticks
+		moveAtTick int // after this many ticks, issue MoveTimer
+		moveDelay  int // ticks
+	}{
+		{12, 14, 4, 14}, // old code: fired 12 ticks late
+		{12, 18, 4, 23}, // old code: fired 12 ticks early
+		{12, 14, 4, 15}, // old code: fired 12 ticks late
+		{12, 20, 5, 3},  // steps == a, fires on next scan of old slot
+		{12, 30, 4, 30}, // multi-revolution move
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(stringx.RandId(), func(t *testing.T) {
+			t.Parallel()
+
+			var count int32
+			ticker := timex.NewFakeTicker()
+			tick := func() {
+				atomic.AddInt32(&count, 1)
+				ticker.Tick()
+				time.Sleep(time.Millisecond * 10)
+			}
+			var actual int32
+			done := make(chan lang.PlaceholderType)
+			tw, err := NewTimingWheelWithTicker(testStep, test.slots, func(key, value any) {
+				actual = atomic.LoadInt32(&count)
+				close(done)
+			}, ticker)
+			assert.Nil(t, err)
+			defer tw.Stop()
+
+			tw.SetTimer(1, 2, testStep*time.Duration(test.setDelay))
+			for i := 0; i < test.moveAtTick; i++ {
+				tick()
+			}
+			tw.MoveTimer(1, testStep*time.Duration(test.moveDelay))
+
+			for {
+				select {
+				case <-done:
+					assert.Equal(t, int32(test.moveAtTick+test.moveDelay), actual)
+					return
+				default:
+					tick()
+				}
+			}
+		})
+	}
+}
+
 func TestTimingWheel_RemoveTimer(t *testing.T) {
 	ticker := timex.NewFakeTicker()
 	tw, _ := NewTimingWheelWithTicker(testStep, 10, func(k, v any) {}, ticker)

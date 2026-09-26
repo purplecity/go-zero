@@ -1,27 +1,84 @@
 // ————————————————————————————————————————————————————————————————————————————
-// timingwheel —— 时间轮定时器(带轮次) —— 文件总结
+// timingwheel —— 时间轮定时器(单层 + 轮次) —— 文件总结
 //
-// numSlots 个槽围成环,ticker 每 interval 走一格;任务按
-// delay 算出目标槽与轮次(circle):delay 超过一圈时任务
-// 挂在目标槽、记 circle,每次扫过 circle-- ,减到 0 才执行
-// —— 一层轮子即可表达任意长的延时。
+// 【干啥用】用"一根指针 + 一圈格子"这一个计时器统一管理
+// 海量"N 秒后做某事"的任务:插入/删除 O(1),每秒只扫指针
+// 指向的一个槽(不像优先队列挤在一个全局堆里),代替成千
+// 上万个独立 timer。真实用途(均为 1s × 300 槽):
 //
-// 并发模型(本文件的核心):所有对外操作(定时/移动/删除/
-// 取空)不直接改数据,而是丢进各自的 channel,由唯一的
-// run goroutine 串行消费 —— 单线程拥有全部状态,零锁、
-// 天然无竞争;ticker 到点也走同一个循环。
+//	· collection/cache.go —— 内存缓存过期:已有 key 每次
+//	  SetWithExpire 走 MoveTimer 滚动续期,新 key SetTimer;
+//	· stores/cache/cleaner.go —— 缓存删除失败延迟重试:
+//	  失败按 1s→5s→1m→5m→1h 退避重新入轮,关机 Drain
+//	  全量执行最后一轮清理。
 //
-// 关键结构:
+// 【钟表模型】把轮子想成只有秒针的表:numSlots 个格子,
+// 指针每 interval 走一格。"3 秒后执行"= 纸条放进"当前格
+// 往前 3 格"的格子里;延时超过一圈时在纸条上写"还差几圈"
+// (circle),指针每次经过该格 circle--,减到 0 的那次经过
+// 才执行 —— 一层轮子即可表达任意长延时。
 //
+// 【槽位/轮次计算】(getPositionAndCircle)
+//
+//	steps  = delay/interval       总步数(向下取整)
+//	pos    = (指针+steps)%槽数    目标格
+//	circle = (steps-1)/槽数       额外圈数
+//
+// steps 要减一:指针走 steps 格到达目标格,该次到达就是
+// 第一次扫到,额外圈数须再减一(steps=6 恰一圈→0;7→1)。
+//
+// 【手推 6 槽例子】interval=1s、numSlots=6、tickedPos
+// 初始=5(停在"上一圈"末槽,首个 tick 正好转到 0 号槽):
+//
+//	t=0    SetTimer(A,3s): steps=3 → 槽2, circle=0
+//	t=0    SetTimer(B,25s): steps=25 → 槽0, circle=4
+//	t=1s   tick 到槽0: B 圈数 4→3(此时剩 24s=4 圈 ✓)
+//	t=2s   tick 到槽1: 空扫,看一眼空链表即返回
+//	t=3s   tick 到槽2: A 到期 → runTasks 另起 goroutine
+//	       异步执行(回调再慢也拖不住指针)
+//	t=3.2  RemoveTimer(B): 只标 removed + 删登记,链表
+//	       节点原地不动(惰性删除,免去 O(n) 遍历找节点)
+//	t=3.5  SetTimer(C,4s): 锚点是最近一次 tick(t=3s 的
+//	       指针)而非"现在": steps=4 → 槽0, circle=0
+//	t=4~6s tick 到槽3/4/5: 空扫
+//	t=7s   tick 到槽0: 同格两种任务一次扫完 —— B 已标
+//	       removed,顺手摘链丢弃;C 到期执行(意图 7.5s,
+//	       实际 7s 触发:锚定整格+向下取格,只会早到不会
+//	       迟到,最多早接近 2 格;精度=interval)
+//
+// 【并发模型】所有对外操作(定时/移动/删除/取空)不直接
+// 改数据,而是丢进各自的 channel,由唯一的 run goroutine
+// 六路 select 串行消费(tick 到点也走同一循环)—— 单线程
+// 拥有全部状态,零锁、天然无竞争;各 API 的 select 同时盯
+// stopChannel,Stop 后调用立刻返回 ErrClosed 而非卡死。
+// 到期任务经 runTasks 逐个 RunSafe 异步发出:单个任务
+// panic 不炸指针 goroutine。
+//
+// 【关键结构】任务双存储:slots 按时间排(给指针扫),
+// timers 按 key 查(给 API O(1) 定位),两个小结构体是
+// 跨存储的粘合件:
+//
+//	baseEntry     任务"身份+请求"内核(仅 key+delay):
+//	             嵌入 timingEntry 作字段前缀;兼作
+//	             moveChannel 载荷(Move 不需 value);
+//	             setTask 对已有 key 以 moveTask(
+//	             task.baseEntry) 把 Set 降级为 Move。
+//	positionEntry timers 登记项:pos 记旧槽号(供 moveTask
+//	             选分支、算 diff),item 指针指回链表节点
+//	             —— Remove/Move 原改 removed/circle/diff
+//	             免扫全轮;drainAll 靠 timer.item==task
+//	             指针比对,防误删重挂后的新登记。
 //	slots    每格一条双向链表(同槽多个任务);
-//	timers   key → 槽位+任务指针(SafeMap),按 key
-//	         O(1) 定位,支撑 Move/Remove;
-//	removed  惰性删除标记:摘链表交给扫描时顺手做,
-//	         避免遍历找节点;
-//	diff     Move 时的"还差几格到新槽",扫描到时
-//	         顺手把任务挪到新槽(setTimerPosition 重登记)。
+//	timers   key → positionEntry(SafeMap;读写实际全在
+//	         run 内,SafeMap 属防御性余量);
+//	removed  惰性删除标记:摘链表交给扫描时顺手做;
+//	diff     Move 时的"还差几格到新槽",扫描到时顺手挪槽
+//	         (setTimerPosition 重登记)。
 //
-// 使用方:cache.go 的过期删除(1s × 300 槽)。
+// 【设计取舍】单层 + 轮次即可覆盖任意延时(1 小时也只
+// circle≈11),省去 Kafka/Netty 式层级轮复杂度;精度 =
+// interval,缓存清理不在乎秒级误差。ticker 可注入
+// FakeTicker,测试可手动拨指针精确控时(cachenode_test.go)。
 // ————————————————————————————————————————————————————————————————————————————
 package collection
 
@@ -90,13 +147,21 @@ type (
 		removed bool
 	}
 
-	// baseEntry 任务基本信息:延时 + 键。
+	// baseEntry 任务"身份+请求"内核(仅 key+delay):
+	// 嵌入 timingEntry 作字段前缀;兼作 moveChannel 载荷
+	// (Move 不需 value);setTask 对已有 key 以
+	// moveTask(task.baseEntry) 把 Set 降级为 Move 复用。
 	baseEntry struct {
 		delay time.Duration
 		key   any
 	}
 
-	// positionEntry timers 表里的登记项:槽位 + 任务指针。
+	// positionEntry timers 登记项:回答"key 的任务在哪"。
+	// item 指针指回槽链表节点,Remove/Move 经 timers O(1)
+	// 定位后原改字段,免扫全轮;pos 记旧槽号,供 moveTask
+	// 选分支、算 diff。item 必须是指针:写要穿透到链表,
+	// 重挂时要原位换新对象(drainAll 的 timer.item==task
+	// 指针比对即防误删新登记)。
 	positionEntry struct {
 		pos  int
 		item *timingEntry
@@ -226,6 +291,14 @@ func (tw *TimingWheel) drainAll(fn func(key, value any)) {
 	runner := threading.NewTaskRunner(drainWorkers)
 
 	for _, slot := range tw.slots {
+		// 边遍历边摘节点的三步式,顺序不能乱:
+		//   ① next := e.Next()  趁链未断先备份下一节点 ——
+		//      标准库 Remove 会把 e 的 next/prev 清成 nil
+		//      (防内存泄漏),之后 e.Next() 只得 nil;
+		//   ② Remove(e) 摘节点;
+		//   ③ e = next 用备份推进 —— for 头的 init
+		//      (slot.Front()) 只执行一次、post 为空,e 的
+		//      前进全靠这行(没它就卡死在首节点)。
 		for e := slot.Front(); e != nil; {
 			task := e.Value.(*timingEntry)
 			next := e.Next()
@@ -269,14 +342,21 @@ func (tw *TimingWheel) initSlots() {
 	}
 }
 
-// moveTask 把任务挪到新延时(只在 run goroutine 内执行):
-// 三种情况 ——
+// moveTask 把任务挪到新延时(只在 run goroutine 内执行)。
+// 记账原则:总预算 steps 格,先扣掉必经段 —— 任务躺在旧槽,
+// 扣圈/搬家都只能等指针扫到旧槽,而指针走到旧槽还需 a 格;
+// 余下 steps-a 格再折算成"整圈进 circle、尾程进 diff",触发
+// 时刻才恰好等于 steps。不能直接抄 SetTimer 的 (steps-1)/N
+// 圈数公式:那是"从指针位置新挂任务"的配套公式,漏掉 a 会
+// 使误差恒为一圈(指针已过旧槽→晚一圈,未过且目标绕后→
+// 早一圈)。
 //
 //	新 delay < 一格:立即执行(等不到下格了);
-//	目标槽在本圈前方(tick 尚未经过):记 diff,扫描时挪;
-//	跨圈(circle>0):轮次减一记 diff(挪到"同圈稍后"的位置);
-//	目标槽在本圈后方(已被 tick 过):旧条目标记 removed,
-//	新建条目挂到目标槽重新登记。
+//	steps < a:意图触发早于指针下次扫到旧槽,diff 无从落地
+//	  —— 旧条目标 removed,新条目按 SetTimer 同款公式立即
+//	  重挂(几何精确);
+//	steps >= a:circle=(steps-a)/槽数,diff=(steps-a)%槽数,
+//	  扫描时先扣圈、扣完挪槽。
 func (tw *TimingWheel) moveTask(task baseEntry) {
 	val, ok := tw.timers.Get(task.key)
 	if !ok {
@@ -292,26 +372,42 @@ func (tw *TimingWheel) moveTask(task baseEntry) {
 		return
 	}
 
-	pos, circle := tw.getPositionAndCircle(task.delay)
-	if pos >= timer.pos {
-		// 前方同圈:diff 记差值,扫描到时挪槽。
-		timer.item.circle = circle
-		timer.item.diff = pos - timer.pos
-	} else if circle > 0 {
-		// 跨圈:按"一圈前"的位置挂,diff 记绕远差值。
-		circle--
-		timer.item.circle = circle
-		timer.item.diff = tw.numSlots + pos - timer.pos
+	steps := int(task.delay / tw.interval)
+	// 指针走到旧槽还需 a 格(取值 1..numSlots),三种情况:
+	var a int
+	if tw.tickedPos > timer.pos {
+		// 旧槽在指针"后方"(数值更小):继续往前走,绕过
+		// 表盘起点回卷 —— 一整圈减去两槽间隔。
+		a = tw.numSlots - (tw.tickedPos - timer.pos)
+	} else if tw.tickedPos == timer.pos {
+		// 指针正踩在旧槽上:这格刚被扫过,再见到它
+		// 要等整整一圈。
+		a = tw.numSlots
 	} else {
-		// 后方且不跨圈:旧条目惰性删除,新条目重挂。
+		// 旧槽在指针"前方":直走差值即可。
+		a = timer.pos - tw.tickedPos
+	}
+	// 上面三个分支可以压缩成一行(相差整圈的数 mod N 后归一,
+	// 再用 -1/+1 把 mod 的输出区间 [0,N-1] 平移成 [1,N]),
+	// 嫌分支长时可用等价的一行式:
+	// a = (timer.pos-tw.tickedPos-1+tw.numSlots)%tw.numSlots + 1
+	if steps < a {
+		// 意图触发早于下次扫到旧槽:只能立即重挂。
 		timer.item.removed = true
 		newItem := &timingEntry{
 			baseEntry: task,
 			value:     timer.item.value,
 		}
+		pos, circle := tw.getPositionAndCircle(task.delay)
+		newItem.circle = circle
 		tw.slots[pos].PushBack(newItem)
 		tw.setTimerPosition(pos, newItem)
+		return
 	}
+
+	// 余下 steps-a 格:整圈进 circle,尾程进 diff。
+	timer.item.circle = (steps - a) / tw.numSlots
+	timer.item.diff = (steps - a) % tw.numSlots
 }
 
 // onTick 走一格:指针前移,扫描并执行新指向槽里的到期任务。
@@ -375,10 +471,14 @@ func (tw *TimingWheel) runTasks(tasks []timingTask) {
 // scanAndRunTasks 扫描一个槽,对每个任务四选一:
 //
 //	removed:摘链表丢弃(惰性删除落地);
-//	circle>0:轮次减一,留下等后续圈;
+//	circle>0:轮次减一,留下等后续圈(节点不摘,无需
+//	         备份 next,e.Next() 直接前进);
 //	diff>0:挪到"当前槽+diff"的新位置(Move 的落地);
 //	其余:到期 —— 收集待执行,摘链表、清登记。
 //
+// 摘节点的分支都用 drainAll 同款三步式(先备份 next →
+// Remove → e=next):标准库 Remove 会清指针,而 for 头的
+// init 只执行一次,推进只能靠备份,不能靠 e.Next()。
 // 执行经 runTasks 异步发出,不阻塞 tick 循环。
 func (tw *TimingWheel) scanAndRunTasks(l *list.List) {
 	var tasks []timingTask
