@@ -18,6 +18,9 @@
 //	  (前一个等结果的调用可能已经填上了)。
 //	cacheStat 每分钟报 QPM/命中率(同 sheddingstat 手法)。
 //
+// 已知并接受的竞态:到期回调异步执行,与"到期瞬间的
+// Set/Del"存在 µs 级窗口(触发苛刻、自愈、无脏数据),
+// 详见 NewCache 时间轮回调处的注释。
 // ————————————————————————————————————————————————————————————————————————————
 package collection
 
@@ -104,6 +107,18 @@ func NewCache(expire time.Duration, opts ...CacheOption) (*Cache, error) {
 			return
 		}
 
+		// 已知并被接受的竞态(2026-09 冻结探针可确定性复现):
+		// 轮子 fire 分两步 —— run 循环里同步注销 timers.Del(key),
+		// 本回调(即下面的 cache.Del)在独立 goroutine 里稍后执行。
+		// 若 key 恰在这 µs 级窗口内被 Set:Set 查 data 见旧值还在
+		// → 走 MoveTimer,而轮子条目已注销 → 静默 no-op(没续上新
+		// 定时器);随后本回调把刚写入的新值删掉。触发条件苛刻
+		// (key 须静止到期 —— 到期前任何 Set 都会推走到期点 —— 又
+		// 恰在注销后 µs 内被重写),后果自愈(下次 Get/Take miss
+		// 回源,无脏数据、不 panic),故接受不改。对称变体见 Del
+		// 注释(误摘新定时器 → 永不过期)。若将来要修:回调改为
+		// "仅当 data[key] 仍等于 fire 携带的 v 快照才删"(当前实现
+		// 把 v 白白丢弃),或给 timingEntry 加代次/fencing。
 		cache.Del(key)
 	})
 	if err != nil {
@@ -127,7 +142,10 @@ func (c *Cache) Del(key string) {
 	// potentially time-consuming operation. Data integrity is maintained by lruCache,
 	// which will eventually evict any remaining entries when capacity is exceeded.
 	// 锁外摘定时器:避免慢操作拖累锁;即使漏摘,到期回调
-	// 删一个不存在的 key 也是无害空操作。
+	// 删一个不存在的 key 也是无害空操作。反向边角:若锁外
+	// 摘除恰好落在"用户刚重 Set 挂上新定时器"的窗口内,会误摘
+	// 新定时器 → 新值永不过期(与 NewCache 回调注释的竞态同族,
+	// 靠 WithLimit 的 LRU 逐出兜底;默认不限容时陪跑到进程结束)。
 	c.timingWheel.RemoveTimer(key)
 }
 
