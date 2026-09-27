@@ -48,6 +48,7 @@ func Inject(ctx context.Context, p propagation.TextMapPropagator, metadata *meta
 // Extract extracts the metadata from ctx.
 func Extract(ctx context.Context, p propagation.TextMapPropagator, metadata *metadata.MD) (
 	baggage.Baggage, sdktrace.SpanContext) {
+	// ctx 现在包含了从 metadata 中提取出的 SpanContext 和 Baggage
 	ctx = p.Extract(ctx, &metadataSupplier{
 		metadata: metadata,
 	})
