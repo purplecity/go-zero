@@ -1,3 +1,21 @@
+// ————————————————————————————————————————————————————————————————————————————
+// cgroup_linux —— cgroup v1/v2 适配:读 CPU 配额与用量 —— 文件总结
+//
+// 两代 cgroup 的文件接口不同,统一成 cgroup 接口三方法:
+//
+//	cpuQuota       配额核数(v1: cpu.cfs_quota_us/period;
+//	                 v2: cpu.max 两段式;"max" = 无限制)
+//	cpuUsage       累计 CPU 用量纳秒(v1: cpuacct.usage;
+//	                 v2: cpu.stat 的 usage_usec×1ms)
+//	effectiveCpus  配到的核数(cpuset)
+//
+// 版本判定:statfs 看 /sys/fs/cgroup 的文件系统魔法数
+// (CGROUP2_SUPER_MAGIC = v2 统一层);v1 用 /proc/self/cgroup
+// 找到本进程各控制器路径(只关心 cpu 前缀的)。
+// 附:parseUints 解析 "0-2,4" 这类 CPU 列表;runningInUserNS
+// 判断用户命名空间(容器常见,userns 里 cgroup 目录可能不存在,
+// 容错处理)。
+// ————————————————————————————————————————————————————————————————————————————
 package internal
 
 import (
@@ -18,25 +36,33 @@ import (
 )
 
 const (
-	cgroupDir   = "/sys/fs/cgroup"
-	cpuMaxFile  = cgroupDir + "/cpu.max"
+	// cgroupDir cgroup 挂载根。
+	cgroupDir = "/sys/fs/cgroup"
+	// v2 的配额文件("max period" 或 "quota period" 两段)。
+	cpuMaxFile = cgroupDir + "/cpu.max"
+	// v2 的用量文件(usage_usec 等键值行)。
 	cpuStatFile = cgroupDir + "/cpu.stat"
-	cpusetFile  = cgroupDir + "/cpuset.cpus.effective"
+	// v2 的有效核列表。
+	cpusetFile = cgroupDir + "/cpuset.cpus.effective"
 )
 
 var (
+	// v2 判定只做一次(statfs)。
 	isUnifiedOnce sync.Once
 	isUnified     bool
-	inUserNS      bool
-	nsOnce        sync.Once
+	// 用户命名空间判定只做一次。
+	inUserNS bool
+	nsOnce   sync.Once
 )
 
+// cgroup 两代实现的统一接口(配额/用量/核数)。
 type cgroup interface {
 	cpuQuota() (float64, error)
 	cpuUsage() (uint64, error)
 	effectiveCpus() (int, error)
 }
 
+// currentCgroup 按版本返回适配器。
 func currentCgroup() (cgroup, error) {
 	if isCgroup2UnifiedMode() {
 		return currentCgroupV2()
@@ -45,10 +71,12 @@ func currentCgroup() (cgroup, error) {
 	return currentCgroupV1()
 }
 
+// cgroupV1 v1 实现:控制器 → 各自目录的散文件。
 type cgroupV1 struct {
 	cgroups map[string]string
 }
 
+// cpuQuota 配额核数 = quota_us / period_us(-1 = 无限制)。
 func (c *cgroupV1) cpuQuota() (float64, error) {
 	quotaUs, err := c.cpuQuotaUs()
 	if err != nil {
@@ -67,6 +95,7 @@ func (c *cgroupV1) cpuQuota() (float64, error) {
 	return float64(quotaUs) / float64(periodUs), nil
 }
 
+// cpuPeriodUs v1 调度周期(微秒)。
 func (c *cgroupV1) cpuPeriodUs() (uint64, error) {
 	data, err := iox.ReadText(path.Join(c.cgroups["cpu"], "cpu.cfs_period_us"))
 	if err != nil {
@@ -76,6 +105,7 @@ func (c *cgroupV1) cpuPeriodUs() (uint64, error) {
 	return parseUint(data)
 }
 
+// cpuQuotaUs v1 每周期配额(微秒;-1 = 无限制)。
 func (c *cgroupV1) cpuQuotaUs() (int64, error) {
 	data, err := iox.ReadText(path.Join(c.cgroups["cpu"], "cpu.cfs_quota_us"))
 	if err != nil {
@@ -85,6 +115,7 @@ func (c *cgroupV1) cpuQuotaUs() (int64, error) {
 	return strconv.ParseInt(data, 10, 64)
 }
 
+// cpuUsage v1 累计用量(纳秒,cpuacct.usage 原生单位)。
 func (c *cgroupV1) cpuUsage() (uint64, error) {
 	data, err := iox.ReadText(path.Join(c.cgroups["cpuacct"], "cpuacct.usage"))
 	if err != nil {
@@ -94,6 +125,7 @@ func (c *cgroupV1) cpuUsage() (uint64, error) {
 	return parseUint(data)
 }
 
+// effectiveCpus v1 有效核数(cpuset 列表长度)。
 func (c *cgroupV1) effectiveCpus() (int, error) {
 	data, err := iox.ReadText(path.Join(c.cgroups["cpuset"], "cpuset.cpus"))
 	if err != nil {
@@ -108,10 +140,14 @@ func (c *cgroupV1) effectiveCpus() (int, error) {
 	return len(cpus), nil
 }
 
+// cgroupV2 v2 实现:统一层级下的键值/两段式文件。
 type cgroupV2 struct {
+	// cpu.stat 解析出的键值(如 usage_usec → 值)。
 	cgroups map[string]string
 }
 
+// cpuQuota 配额核数:cpu.max 两段 "quota period"
+// ("max ..." = 无限制)。
 func (c *cgroupV2) cpuQuota() (float64, error) {
 	data, err := iox.ReadText(cpuMaxFile)
 	if err != nil {
@@ -140,6 +176,7 @@ func (c *cgroupV2) cpuQuota() (float64, error) {
 	return float64(quotaUs) / float64(periodUs), nil
 }
 
+// cpuUsage 累计用量纳秒 = usage_usec × 1ms。
 func (c *cgroupV2) cpuUsage() (uint64, error) {
 	usec, err := parseUint(c.cgroups["usage_usec"])
 	if err != nil {
@@ -149,6 +186,7 @@ func (c *cgroupV2) cpuUsage() (uint64, error) {
 	return usec * uint64(time.Microsecond), nil
 }
 
+// effectiveCpus v2 有效核数。
 func (c *cgroupV2) effectiveCpus() (int, error) {
 	data, err := iox.ReadText(cpusetFile)
 	if err != nil {
@@ -163,6 +201,8 @@ func (c *cgroupV2) effectiveCpus() (int, error) {
 	return len(cpus), nil
 }
 
+// currentCgroupV1 从 /proc/self/cgroup 找本进程的各控制器路径,
+// 只保留 cpu 前缀的控制器(cpu/cpuacct/cpuset)。
 func currentCgroupV1() (cgroup, error) {
 	cgroupFile := fmt.Sprintf("/proc/%d/cgroup", os.Getpid())
 	lines, err := iox.ReadTextLines(cgroupFile, iox.WithoutBlank())
@@ -195,6 +235,8 @@ func currentCgroupV1() (cgroup, error) {
 	}, nil
 }
 
+// currentCgroupV2 读根 cgroup 的 cpu.stat 键值表
+// (v2 统一层,不需要 /proc/self/cgroup 定位路径)。
 func currentCgroupV2() (cgroup, error) {
 	lines, err := iox.ReadTextLines(cpuStatFile, iox.WithoutBlank())
 	if err != nil {
@@ -217,6 +259,7 @@ func currentCgroupV2() (cgroup, error) {
 }
 
 // isCgroup2UnifiedMode returns whether we are running in cgroup v2 unified mode.
+// v2 判定:statfs 魔法数;userns 下目录缺失按 v1 容错。
 func isCgroup2UnifiedMode() bool {
 	isUnifiedOnce.Do(func() {
 		var st unix.Statfs_t
@@ -235,6 +278,7 @@ func isCgroup2UnifiedMode() bool {
 	return isUnified
 }
 
+// parseUint 宽容解析:溢出/负数都归 0(v2 某些值可能超大)。
 func parseUint(s string) (uint64, error) {
 	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
@@ -252,6 +296,7 @@ func parseUint(s string) (uint64, error) {
 	return uint64(v), nil
 }
 
+// parseUints 解析 CPU 列表 "0-2,4"(区间展开 + 去重)。
 func parseUints(val string) ([]uint64, error) {
 	if val == "" {
 		return nil, nil
@@ -299,6 +344,8 @@ func parseUints(val string) ([]uint64, error) {
 }
 
 // runningInUserNS detects whether we are currently running in a user namespace.
+// 用户命名空间判定:uid_map 首行非"0 0 全范围"即在 userns
+// (容器/无 root 场景常见)。
 func runningInUserNS() bool {
 	nsOnce.Do(func() {
 		file, err := os.Open("/proc/self/uid_map")

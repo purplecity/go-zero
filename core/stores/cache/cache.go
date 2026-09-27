@@ -1,3 +1,37 @@
+// ————————————————————————————————————————————————————————————————————————————
+// cache —— Redis 缓存:客户端分片路由壳 —— 文件总结
+//
+// 【包结构】四块各司其职,靠 Cache 接口串联(单节点与集群
+// 对调用方无感;单节点配置时 New 直接返回节点,不套壳):
+//
+//	cache.go      路由壳:一致性哈希决定 key 归哪个节点 ——
+//	              dispatcher.Get(key) 是"问路"不是读数据;
+//	              Del 多 key 时按节点分组批量发;
+//	cachenode.go  节点逻辑:读写 + Take 回源(双检/占位符);
+//	cleaner.go    删除失败退避重试(1s→5s→1m→5m→1h);
+//	cachestat.go  命中率统计。
+//
+// 【四大病四味药】每个机制恰好防一种经典事故,不多不少:
+//
+//	击穿(热 key 过期瞬间并发全打 DB)→ SingleFlight 合并
+//	  回源 + 双检(doTake 进 barrier 先 GET 一次 —— barrier
+//	  只合并"进行中"的并发,上一轮回填的结果靠缓存粘连);
+//	穿透(不存在的 key 反复打 DB)→ "*" 占位符 + SETNX
+//	  短过期(setCacheWithNotFound);
+//	雪崩(同批 key 同一秒集体过期)→ ±5% 过期抖动
+//	  (unstableExpiry,mathx.Unstable);
+//	不一致(DB 更新了缓存删不掉)→ 退避重试 + TTL 兜底。
+//
+// 另一条保命原则:Redis 出错直接 fail fast,绝不放流量去
+// 打 DB(doTake 注释:"don't allow the disaster pass to
+// the dbs")。
+//
+// 【分片说明】"多个独立 Redis" ≠ "Redis Cluster":ClusterConf
+// 每项是独立实例,路由在客户端做(支持按权重);每个逻辑
+// 节点底层也可以是整个 Redis Cluster(c.rds.Type 分支),
+// 两层可叠加。一致性哈希解决横向容量(同 key 恒路由同节点,
+// 增删节点只迁 ~1/N),高可用靠各节点自己的主从/哨兵。
+// ————————————————————————————————————————————————————————————————————————————
 package cache
 
 import (

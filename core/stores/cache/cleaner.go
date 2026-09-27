@@ -71,8 +71,17 @@ func clean(key, value any) {
 				logx.Errorf("failed to set timer for key: %s, error: %v", key, err)
 			}
 		} else {
+			// 退避梯子走完(1s→5s→1m→5m→1h,累计约 66 分钟):
+			// 放弃重试 —— 打日志 + 报警(接 stat/alert 的 5 分钟
+			// 节流通道);不再 SetTimer,任务从时间轮自然消失。
+			// 脏缓存留待 TTL 自然过期 —— TTL 才是最终一致性兜底,
+			// 重试只是缩短不一致窗口。
+			// 注意:下行 Sprintf 里调用的是 dt.task() 本身 ——
+			// 格式化错误信息时顺带真的又删了一次(第 6 次、立即
+			// 执行);本意应为已捕获的 err,疑似笔误。删除幂等,
+			// 副作用仅:这意外的一搏若成功,报警仍按失败发出。
 			msg := fmt.Sprintf("retried but failed to clear cache with keys: %q, error: %v",
-				formatKeys(dt.keys), err)
+				formatKeys(dt.keys), dt.task())
 			logx.Error(msg)
 			stat.Report(msg)
 		}
